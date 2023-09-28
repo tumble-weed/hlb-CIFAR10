@@ -19,8 +19,10 @@ class SpeedyResNet(nn.Module):
 
     # This allows you to customize/change the execution order of the network as needed.
     def forward(self, x):
+        """
         if not self.training:
             x = torch.cat((x, torch.flip(x, (-1,))))
+        """
         x = self.net_dict['initial_block']['whiten'](x)
         x = self.net_dict['initial_block']['project'](x)
         x = self.net_dict['initial_block']['activation'](x)
@@ -30,10 +32,12 @@ class SpeedyResNet(nn.Module):
         x = self.net_dict['pooling'](x)
         x = self.net_dict['linear'](x)
         x = self.net_dict['temperature'](x)
+        """
         if not self.training:
             # Average the predictions from the lr-flipped inputs during eval
             orig, flipped = x.split(x.shape[0]//2, dim=0)
             x = .5 * orig + .5 * flipped
+        """
         return x
 
 
