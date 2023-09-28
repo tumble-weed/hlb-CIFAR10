@@ -20,7 +20,7 @@ from torch import nn
 
 import torchvision
 from torchvision import transforms
-
+import train_utils
 ## <-- teaching comments
 # <-- functional comments
 # You can run 'sed -i.bak '/\#\#/d' ./main.py' to remove the teaching comments if they are in the way of your work. <3
@@ -291,236 +291,10 @@ def set_whitening_conv(conv_layer, eigenvalues, eigenvectors, eps=1e-2, freeze=T
         conv_layer.weight.requires_grad = False
 
 
-#############################################
-#            Network Definition             #
-#############################################
-
-scaler = 2. ## You can play with this on your own if you want, for the first beta I wanted to keep things simple (for now) and leave it out of the hyperparams dict
-depths = {
-    'init':   round(scaler**-1*hyp['net']['base_depth']), # 32  w/ scaler at base value
-    'block1': round(scaler** 0*hyp['net']['base_depth']), # 64  w/ scaler at base value
-    'block2': round(scaler** 2*hyp['net']['base_depth']), # 256 w/ scaler at base value
-    'block3': round(scaler** 3*hyp['net']['base_depth']), # 512 w/ scaler at base value
-    'num_classes': 10
-}
-
-class SpeedyResNet(nn.Module):
-    def __init__(self, network_dict):
-        super().__init__()
-        self.net_dict = network_dict # flexible, defined in the make_net function
-
-    # This allows you to customize/change the execution order of the network as needed.
-    def forward(self, x):
-        if not self.training:
-            x = torch.cat((x, torch.flip(x, (-1,))))
-        x = self.net_dict['initial_block']['whiten'](x)
-        x = self.net_dict['initial_block']['project'](x)
-        x = self.net_dict['initial_block']['activation'](x)
-        x = self.net_dict['residual1'](x)
-        x = self.net_dict['residual2'](x)
-        x = self.net_dict['residual3'](x)
-        x = self.net_dict['pooling'](x)
-        x = self.net_dict['linear'](x)
-        x = self.net_dict['temperature'](x)
-        if not self.training:
-            # Average the predictions from the lr-flipped inputs during eval
-            orig, flipped = x.split(x.shape[0]//2, dim=0)
-            x = .5 * orig + .5 * flipped
-        return x
-
-def make_net():
-    # TODO: A way to make this cleaner??
-    # Note, you have to specify any arguments overlapping with defaults (i.e. everything but in/out depths) as kwargs so that they are properly overridden (TODO cleanup somehow?)
-    whiten_conv_depth = 3*hyp['net']['whitening']['kernel_size']**2
-    network_dict = nn.ModuleDict({
-        'initial_block': nn.ModuleDict({
-            'whiten': Conv(3, whiten_conv_depth, kernel_size=hyp['net']['whitening']['kernel_size'], padding=0),
-            'project': Conv(whiten_conv_depth, depths['init'], kernel_size=1, norm=2.2), # The norm argument means we renormalize the weights to be length 1 for this as the power for the norm, each step
-            'activation': nn.GELU(),
-        }),
-        'residual1': ConvGroup(depths['init'],   depths['block1'], hyp['net']['conv_norm_pow']),
-        'residual2': ConvGroup(depths['block1'], depths['block2'], hyp['net']['conv_norm_pow']),
-        'residual3': ConvGroup(depths['block2'], depths['block3'], hyp['net']['conv_norm_pow']),
-        'pooling': FastGlobalMaxPooling(),
-        'linear': Linear(depths['block3'], depths['num_classes'], bias=False, norm=5.),
-        'temperature': TemperatureScaler(hyp['opt']['scaling_factor'])
-    })
-
-    net = SpeedyResNet(network_dict)
-    net = net.to(hyp['misc']['device'])
-    net = net.to(memory_format=torch.channels_last) # to appropriately use tensor cores/avoid thrash while training
-    net.train()
-    net.half() # Convert network to half before initializing the initial whitening layer.
-
-
-    ## Initialize the whitening convolution
-    with torch.no_grad():
-        # Initialize the first layer to be fixed weights that whiten the expected input values of the network be on the unit hypersphere. (i.e. their...average vector length is 1.?, IIRC)
-        init_whitening_conv(net.net_dict['initial_block']['whiten'],
-                            data['train']['images'].index_select(0, torch.randperm(data['train']['images'].shape[0], device=data['train']['images'].device)),
-                            num_examples=hyp['net']['whitening']['num_examples'],
-                            pad_amount=hyp['net']['pad_amount'],
-                            whiten_splits=5000) ## Hardcoded for now while we figure out the optimal whitening number
-                                                ## If you're running out of memory (OOM) feel free to decrease this, but
-                                                ## the index lookup in the dataloader may give you some trouble depending
-                                                ## upon exactly how memory-limited you are
-
-        ## We initialize the projections layer to return exactly the spatial inputs, this way we start
-        ## at a nice clean place (the whitened image in feature space, directly) and can iterate directly from there.
-        torch.nn.init.dirac_(net.net_dict['initial_block']['project'].weight)
-
-        for layer_name in net.net_dict.keys():
-            if 'residual' in layer_name:
-                ## We do the same for the second layer in each residual block, since this only
-                ## adds a simple multiplier to the inputs instead of the noise of a randomly-initialized
-                ## convolution. This can be easily scaled down by the network, and the weights can more easily
-                ## pivot in whichever direction they need to go now.
-                torch.nn.init.dirac_(net.net_dict[layer_name].conv2.weight)
-
-    return net
-
-#############################################
-#            Data Preprocessing             #
-#############################################
-
-## This is actually (I believe) a pretty clean implementation of how to do something like this, since shifted-square masks unique to each depth-channel can actually be rather
-## tricky in practice. That said, if there's a better way, please do feel free to submit it! This can be one of the harder parts of the code to understand (though I personally get
-## stuck on the fold/unfold process for the lower-level convolution calculations.
-def make_random_square_masks(inputs, mask_size):
-    ##### TODO: Double check that this properly covers the whole range of values. :'( :')
-    if mask_size == 0:
-        return None # no need to cutout or do anything like that since the patch_size is set to 0
-    is_even = int(mask_size % 2 == 0)
-    in_shape = inputs.shape
-
-    # seed centers of squares to cutout boxes from, in one dimension each
-    mask_center_y = torch.empty(in_shape[0], dtype=torch.long, device=inputs.device).random_(mask_size//2-is_even, in_shape[-2]-mask_size//2-is_even)
-    mask_center_x = torch.empty(in_shape[0], dtype=torch.long, device=inputs.device).random_(mask_size//2-is_even, in_shape[-1]-mask_size//2-is_even)
-
-    # measure distance, using the center as a reference point
-    to_mask_y_dists = torch.arange(in_shape[-2], device=inputs.device).view(1, 1, in_shape[-2], 1) - mask_center_y.view(-1, 1, 1, 1)
-    to_mask_x_dists = torch.arange(in_shape[-1], device=inputs.device).view(1, 1, 1, in_shape[-1]) - mask_center_x.view(-1, 1, 1, 1)
-
-    to_mask_y = (to_mask_y_dists >= (-(mask_size // 2) + is_even)) * (to_mask_y_dists <= mask_size // 2)
-    to_mask_x = (to_mask_x_dists >= (-(mask_size // 2) + is_even)) * (to_mask_x_dists <= mask_size // 2)
-
-    final_mask = to_mask_y * to_mask_x ## Turn (y by 1) and (x by 1) boolean masks into (y by x) masks through multiplication. Their intersection is square, hurray! :D
-
-    return final_mask
-
-
-def batch_cutmix(inputs, targets, patch_size):
-    with torch.no_grad():
-        batch_permuted = torch.randperm(inputs.shape[0], device='cuda')
-        cutmix_batch_mask = make_random_square_masks(inputs, patch_size)
-        if cutmix_batch_mask is None:
-            return inputs, targets # if the mask is None, then that's because the patch size was set to 0 and we will not be using cutmix today.
-        # We draw other samples from inside of the same batch
-        cutmix_batch = torch.where(cutmix_batch_mask, torch.index_select(inputs, 0, batch_permuted), inputs)
-        cutmix_targets = torch.index_select(targets, 0, batch_permuted)
-        # Get the percentage of each target to mix for the labels by the % proportion of pixels in the mix
-        portion_mixed = float(patch_size**2)/(inputs.shape[-2]*inputs.shape[-1])
-        cutmix_labels = portion_mixed * cutmix_targets + (1. - portion_mixed) * targets
-        return cutmix_batch, cutmix_labels
-
-def batch_crop(inputs, crop_size):
-    with torch.no_grad():
-        crop_mask_batch = make_random_square_masks(inputs, crop_size)
-        cropped_batch = torch.masked_select(inputs, crop_mask_batch).view(inputs.shape[0], inputs.shape[1], crop_size, crop_size)
-        return cropped_batch
-
-def batch_flip_lr(batch_images, flip_chance=.5):
-    with torch.no_grad():
-        # TODO: Is there a more elegant way to do this? :') :'((((
-        return torch.where(torch.rand_like(batch_images[:, 0, 0, 0].view(-1, 1, 1, 1)) < flip_chance, torch.flip(batch_images, (-1,)), batch_images)
-
-
-########################################
-#          Training Helpers            #
-########################################
-
-class NetworkEMA(nn.Module):
-    def __init__(self, net):
-        super().__init__() # init the parent module so this module is registered properly
-        self.net_ema = copy.deepcopy(net).eval().requires_grad_(False) # copy the model
-
-    def update(self, current_net, decay):
-        with torch.no_grad():
-            for ema_net_parameter, (parameter_name, incoming_net_parameter) in zip(self.net_ema.state_dict().values(), current_net.state_dict().items()): # potential bug: assumes that the network architectures don't change during training (!!!!)
-                if incoming_net_parameter.dtype in (torch.half, torch.float):
-                    ema_net_parameter.mul_(decay).add_(incoming_net_parameter.detach().mul(1. - decay)) # update the ema values in place, similar to how optimizer momentum is coded
-                    # And then we also copy the parameters back to the network, similarly to the Lookahead optimizer (but with a much more aggressive-at-the-end schedule)
-                    if not ('norm' in parameter_name and 'weight' in parameter_name) and not 'whiten' in parameter_name:
-                        incoming_net_parameter.copy_(ema_net_parameter.detach())
-
-    def forward(self, inputs):
-        with torch.no_grad():
-            return self.net_ema(inputs)
-
-# TODO: Could we jit this in the (more distant) future? :)
-@torch.no_grad()
-def get_batches(data_dict, key, batchsize, epoch_fraction=1., cutmix_size=None):
-    num_epoch_examples = len(data_dict[key]['images'])
-    shuffled = torch.randperm(num_epoch_examples, device='cuda')
-    if epoch_fraction < 1:
-        shuffled = shuffled[:batchsize * round(epoch_fraction * shuffled.shape[0]/batchsize)] # TODO: Might be slightly inaccurate, let's fix this later... :) :D :confetti: :fireworks:
-        num_epoch_examples = shuffled.shape[0]
-    crop_size = 32
-    ## Here, we prep the dataset by applying all data augmentations in batches ahead of time before each epoch, then we return an iterator below
-    ## that iterates in chunks over with a random derangement (i.e. shuffled indices) of the individual examples. So we get perfectly-shuffled
-    ## batches (which skip the last batch if it's not a full batch), but everything seems to be (and hopefully is! :D) properly shuffled. :)
-    if key == 'train':
-        images = batch_crop(data_dict[key]['images'], crop_size) # TODO: hardcoded image size for now?
-        images = batch_flip_lr(images)
-        images, targets = batch_cutmix(images, data_dict[key]['targets'], patch_size=cutmix_size)
-    else:
-        images = data_dict[key]['images']
-        targets = data_dict[key]['targets']
-
-    # Send the images to an (in beta) channels_last to help improve tensor core occupancy (and reduce NCHW <-> NHWC thrash) during training
-    images = images.to(memory_format=torch.channels_last)
-    for idx in range(num_epoch_examples // batchsize):
-        if not (idx+1)*batchsize > num_epoch_examples: ## Use the shuffled randperm to assemble individual items into a minibatch
-            yield images.index_select(0, shuffled[idx*batchsize:(idx+1)*batchsize]), \
-                  targets.index_select(0, shuffled[idx*batchsize:(idx+1)*batchsize]) ## Each item is only used/accessed by the network once per epoch. :D
-
-
-def init_split_parameter_dictionaries(network):
-    params_non_bias = {'params': [], 'lr': hyp['opt']['non_bias_lr'], 'momentum': .85, 'nesterov': True, 'weight_decay': hyp['opt']['non_bias_decay'], 'foreach': True}
-    params_bias     = {'params': [], 'lr': hyp['opt']['bias_lr'],     'momentum': .85, 'nesterov': True, 'weight_decay': hyp['opt']['bias_decay'], 'foreach': True}
-
-    for name, p in network.named_parameters():
-        if p.requires_grad:
-            if 'bias' in name:
-                params_bias['params'].append(p)
-            else:
-                params_non_bias['params'].append(p)
-    return params_non_bias, params_bias
-
 
 ## Hey look, it's the soft-targets/label-smoothed loss! Native to PyTorch. Now, _that_ is pretty cool, and simplifies things a lot, to boot! :D :)
 loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, reduction='none')
-
-logging_columns_list = ['epoch', 'train_loss', 'val_loss', 'train_acc', 'val_acc', 'ema_val_acc', 'total_time_seconds']
-# define the printing function and print the column heads
-def print_training_details(columns_list, separator_left='|  ', separator_right='  ', final="|", column_heads_only=False, is_final_entry=False):
-    print_string = ""
-    if column_heads_only:
-        for column_head_name in columns_list:
-            print_string += separator_left + column_head_name + separator_right
-        print_string += final
-        print('-'*(len(print_string))) # print the top bar
-        print(print_string)
-        print('-'*(len(print_string))) # print the bottom bar
-    else:
-        for column_value in columns_list:
-            print_string += separator_left + column_value + separator_right
-        print_string += final
-        print(print_string)
-    if is_final_entry:
-        print('-'*(len(print_string))) # print the final output bar
-
-print_training_details(logging_columns_list, column_heads_only=True) ## print out the training column heads before we print the actual content for each run.
+train_utils.print_training_details(logging_columns_list, column_heads_only=True) ## print out the training column heads before we print the actual content for each run.
 
 ########################################
 #           Train and Eval             #
@@ -661,10 +435,14 @@ def main():
           # Print out our training details (sorry for the complexity, the whole logging business here is a bit of a hot mess once the columns need to be aligned and such....)
           ## We also check to see if we're in our final epoch so we can print the 'bottom' of the table for each round.
           print_training_details(list(map(partial(format_for_table, locals=locals()), logging_columns_list)), is_final_entry=(epoch >= math.ceil(hyp['misc']['train_epochs'] - 1)))
-    return ema_val_acc # Return the final ema accuracy achieved (not using the 'best accuracy' selection strategy, which I think is okay here....)
+    return ema_val_acc,net # Return the final ema accuracy achieved (not using the 'best accuracy' selection strategy, which I think is okay here....)
 
-if __name__ == "__main__":
+def get_performance_statistics():
     acc_list = []
     for run_num in range(25):
-        acc_list.append(torch.tensor(main()))
+        acc_list.append(torch.tensor(main()[0]))
     print("Mean and variance:", (torch.mean(torch.stack(acc_list)).item(), torch.var(torch.stack(acc_list)).item()))
+
+if __name__ == "__main__":
+    # get_performance_statistics()
+    ema_acc,net = main()
